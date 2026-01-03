@@ -1,6 +1,108 @@
 #include "Utilities.h"
+
+#include <Windows.h>
+
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <string_view>
+#include <vector>
+
 using namespace RE;
 using std::unordered_map;
+
+namespace
+{
+	constexpr char kConfigFileName[] = "SeamlessInspectMods.txt";
+	constexpr char kDefaultPluginName[] = "Inspectweapons.esl";
+	constexpr uintptr_t kInspectQuestFormID = 0x805;
+
+	std::vector<std::string> g_pluginFilenames;
+	bool g_warnedMissingQuest = false;
+
+	std::string TrimLine(std::string_view a_line)
+	{
+		const auto first = a_line.find_first_not_of(" \t\r\n");
+		if (first == std::string_view::npos) {
+			return {};
+		}
+
+		const auto last = a_line.find_last_not_of(" \t\r\n");
+		return std::string{ a_line.substr(first, last - first + 1) };
+	}
+
+	std::filesystem::path GetConfigPath()
+	{
+		wchar_t runtimePath[MAX_PATH];
+		const auto length = ::GetModuleFileNameW(nullptr, runtimePath, MAX_PATH);
+		if (length == 0 || length == MAX_PATH) {
+			logger::warn("Failed to resolve runtime path for SeamlessInspect config lookup");
+			return {};
+		}
+
+		std::filesystem::path path(runtimePath);
+		path = path.parent_path() / "Data" / "F4SE" / "Plugins" / kConfigFileName;
+		return path;
+	}
+
+	void LoadPluginFilenames()
+	{
+		g_pluginFilenames.clear();
+		const auto configPath = GetConfigPath();
+		if (!configPath.empty()) {
+			std::ifstream stream(configPath);
+			if (stream.is_open()) {
+				std::string line;
+				while (std::getline(stream, line)) {
+					auto trimmed = TrimLine(line);
+					if (!trimmed.empty()) {
+						g_pluginFilenames.emplace_back(std::move(trimmed));
+					}
+				}
+
+				if (g_pluginFilenames.empty()) {
+					logger::warn("Config file {} was empty; SeamlessInspect will use default plugin", configPath.string());
+				} else {
+					logger::info("Loaded {} plugin filename(s) from {}", g_pluginFilenames.size(), configPath.string());
+				}
+			} else {
+				logger::warn("Failed to open config file {}; SeamlessInspect will use default plugin", configPath.string());
+			}
+		}
+
+		if (g_pluginFilenames.empty()) {
+			g_pluginFilenames.emplace_back(kDefaultPluginName);
+		}
+	}
+
+	bool MatchesConfiguredPlugin(const char* a_filename)
+	{
+		if (!a_filename) {
+			return false;
+		}
+
+		for (const auto& name : g_pluginFilenames) {
+			if (_stricmp(name.c_str(), a_filename) == 0) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	TESQuest* ResolveInspectQuest()
+	{
+		for (const auto& name : g_pluginFilenames) {
+			if (auto form = GetFormFromMod(name.c_str(), kInspectQuestFormID)) {
+				logger::info("Inspect quest resolved from {}", name);
+				return static_cast<TESQuest*>(form);
+			}
+		}
+
+		logger::error("Failed to resolve inspect quest from configured plugin list");
+		return nullptr;
+	}
+}
 
 PlayerCharacter* p;
 TESQuest* inspectQuest;
@@ -10,11 +112,16 @@ static uintptr_t SetupSpecialIdleOrig;
 
 bool HookedSetupSpecialIdle(AIProcess* ai, Actor& a, DEFAULT_OBJECT obj, TESIdleForm* idle, bool b, TESObjectREFR* target)
 {
-	if (idle) {
+	if (idle && idle->sourceFiles.array) {
 		for (auto fileit = idle->sourceFiles.array->begin(); fileit != idle->sourceFiles.array->end(); ++fileit) {
-			if (strcmp("Inspectweapons.esl", (*fileit)->filename) == 0) {
-				inspectQuest->currentStage = 1;
-				bool succ = inspectQuest->SetStage(1);
+			if (MatchesConfiguredPlugin((*fileit)->filename)) {
+				if (inspectQuest) {
+					inspectQuest->currentStage = 1;
+					inspectQuest->SetStage(1);
+				} else if (!g_warnedMissingQuest) {
+					logger::warn("Inspect quest was not resolved; SeamlessInspect cannot skip equip animation");
+					g_warnedMissingQuest = true;
+				}
 				break;
 			}
 		}
@@ -31,9 +138,9 @@ public:
 
 	BSEventNotifyControl HookedProcessEvent(BSAnimationGraphEvent& evn, BSTEventSource<BSAnimationGraphEvent>* src)
 	{
-		if (evn.animEvent == "IdleStop") {
-			if (inspectQuest->currentStage == 1) {
-				F4::BGSAnimationSystemUtils::InitializeActorInstant(*p, false);
+		if (evn.tag == "IdleStop") {
+			if (inspectQuest && inspectQuest->currentStage == 1) {
+				BGSAnimationSystemUtils::InitializeActorInstant(*p, false);
 				p->UpdateAnimation(0.2f);
 				inspectQuest->SetStage(0);
 			}
@@ -60,7 +167,12 @@ unordered_map<uintptr_t, AnimationGraphEventWatcher::FnProcessEvent> AnimationGr
 void InitializePlugin()
 {
 	p = PlayerCharacter::GetSingleton();
-	inspectQuest = (TESQuest*)GetFormFromMod("Inspectweapons.esl", 0x805);
+	if (!p) {
+		logger::critical("Failed to acquire PlayerCharacter singleton; SeamlessInspect disabled");
+		return;
+	}
+
+	inspectQuest = ResolveInspectQuest();
 	((AnimationGraphEventWatcher*)((uint64_t)p + 0x38))->HookSink();
 }
 
@@ -84,7 +196,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
 	log->set_level(spdlog::level::trace);
 #else
 	log->set_level(spdlog::level::info);
-	log->flush_on(spdlog::level::warn);
+	log->flush_on(spdlog::level::info);
 #endif
 
 	spdlog::set_default_logger(std::move(log));
@@ -115,6 +227,7 @@ extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Query(const F4SE::QueryInterface* a
 extern "C" DLLEXPORT bool F4SEAPI F4SEPlugin_Load(const F4SE::LoadInterface* a_f4se)
 {
 	F4SE::Init(a_f4se);
+	LoadPluginFilenames();
 
 	F4SE::Trampoline& trampoline = F4SE::GetTrampoline();
 	SetupSpecialIdleOrig = trampoline.write_call<5>(ptr_SetupSpecialIdle.address(), &HookedSetupSpecialIdle);
