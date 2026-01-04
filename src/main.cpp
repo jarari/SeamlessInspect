@@ -1,5 +1,3 @@
-#include "Utilities.h"
-
 #include <Windows.h>
 
 #include <filesystem>
@@ -10,6 +8,23 @@
 
 using namespace RE;
 using std::unordered_map;
+
+template <class Ty>
+Ty SafeWrite64Function(uintptr_t addr, Ty data)
+{
+	DWORD oldProtect;
+	void* _d[2];
+	memcpy(_d, &data, sizeof(data));
+	size_t len = sizeof(_d[0]);
+
+	VirtualProtect((void*)addr, len, PAGE_EXECUTE_READWRITE, &oldProtect);
+	Ty olddata;
+	memset(&olddata, 0, sizeof(Ty));
+	memcpy(&olddata, (void*)addr, len);
+	memcpy((void*)addr, &_d[0], len);
+	VirtualProtect((void*)addr, len, oldProtect, &oldProtect);
+	return olddata;
+}
 
 namespace
 {
@@ -93,7 +108,7 @@ namespace
 	TESQuest* ResolveInspectQuest()
 	{
 		for (const auto& name : g_pluginFilenames) {
-			if (auto form = GetFormFromMod(name.c_str(), kInspectQuestFormID)) {
+			if (auto form = RE::TESDataHandler::GetSingleton()->LookupForm(kInspectQuestFormID, name)) {
 				logger::info("Inspect quest resolved from {}", name);
 				return static_cast<TESQuest*>(form);
 			}
